@@ -1,12 +1,15 @@
-// CleanMemory - frees RAM without killing any process.
-//   1. Trims the working set of every running process (pages go to standby, not lost).
-//   2. Flushes the modified page list to disk.
-//   3. Purges the standby list (cached file data) so it shows up as "free".
+// CleanMemory - frees RAM. Closes Steam; no other process is killed.
+//   1. Closes Steam and all its processes (graceful "-shutdown" first, then force-kill).
+//   2. Trims the working set of every running process (pages go to standby, not lost).
+//   3. Flushes the modified page list to disk.
+//   4. Purges the standby list (cached file data) so it shows up as "free".
 // Requires administrator rights (requested via the embedded manifest).
 
 using System;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
+using Microsoft.Win32;
 
 class CleanMemory
 {
@@ -93,6 +96,48 @@ class CleanMemory
         return NtSetSystemInformation(SystemMemoryListInformation, ref command, sizeof(int)) == 0;
     }
 
+    // Steam-related processes, matched by name prefix: steam, steamwebhelper, SteamService,
+    // steamerrorreporter, gameoverlayui, ...
+    static readonly string[] SteamPrefixes = { "steam", "gameoverlayui" };
+
+    static Process[] GetSteamProcesses()
+    {
+        return Process.GetProcesses().Where(p =>
+            SteamPrefixes.Any(s => p.ProcessName.StartsWith(s, StringComparison.OrdinalIgnoreCase))).ToArray();
+    }
+
+    // Returns the number of Steam processes that were running.
+    static int CloseSteam()
+    {
+        var procs = GetSteamProcesses();
+        if (procs.Length == 0) return 0;
+
+        // Graceful first, so Steam can finish cloud saves and write its config.
+        // Only done if the main client is running, so this never launches Steam.
+        var client = procs.FirstOrDefault(p => p.ProcessName.Equals("steam", StringComparison.OrdinalIgnoreCase));
+        if (client != null)
+        {
+            try
+            {
+                string exe = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamExe", null) as string
+                             ?? client.MainModule.FileName;
+                Process.Start(exe, "-shutdown");
+                client.WaitForExit(15000);
+            }
+            catch { }
+        }
+
+        // Force-kill whatever is left (helpers, service, or a client that ignored -shutdown).
+        foreach (var p in GetSteamProcesses())
+        {
+            try { p.Kill(); p.WaitForExit(3000); }
+            catch { }
+            finally { p.Dispose(); }
+        }
+        foreach (var p in procs) p.Dispose();
+        return procs.Length;
+    }
+
     static int TrimAllWorkingSets()
     {
         int trimmed = 0;
@@ -122,19 +167,26 @@ class CleanMemory
         EnablePrivilege("SeIncreaseQuotaPrivilege");
         EnablePrivilege("SeDebugPrivilege");
 
-        Console.WriteLine("[1/3] Trimming process working sets... {0} processes trimmed", TrimAllWorkingSets());
+        Console.Write("[1/4] Closing Steam...                ");
+        int steam = CloseSteam();
+        int left = GetSteamProcesses().Length;
+        Console.WriteLine(steam == 0 ? "not running"
+                        : left == 0 ? steam + " processes closed"
+                        : left + " processes could not be closed");
+
+        Console.WriteLine("[2/4] Trimming process working sets... {0} processes trimmed", TrimAllWorkingSets());
 
         if (admin)
         {
-            Console.WriteLine("[2/3] Flushing modified page list...  {0}",
+            Console.WriteLine("[3/4] Flushing modified page list...  {0}",
                 SystemMemoryCommand(MemoryFlushModifiedList) ? "OK" : "failed");
-            Console.WriteLine("[3/3] Purging standby list...         {0}",
+            Console.WriteLine("[4/4] Purging standby list...         {0}",
                 SystemMemoryCommand(MemoryPurgeStandbyList) ? "OK" : "failed");
         }
         else
         {
-            Console.WriteLine("[2/3] Skipped - run as administrator to flush/purge system lists.");
-            Console.WriteLine("[3/3] Skipped.");
+            Console.WriteLine("[3/4] Skipped - run as administrator to flush/purge system lists.");
+            Console.WriteLine("[4/4] Skipped.");
         }
 
         var after = GetMemory();

@@ -1,14 +1,24 @@
-// CleanMemory - frees RAM. Closes Steam; no other process is killed.
-//   1. Closes Steam and all its processes (graceful "-shutdown" first, then force-kill).
-//   2. Trims the working set of every running process (pages go to standby, not lost).
+// CleanMemory - frees RAM before playing VALORANT, then launches it.
+//   1. Closes the apps listed in kill-list.txt (next to the exe). Steam gets a graceful
+//      "-shutdown", other apps get their window closed, and anything left is force-killed.
+//      Riot Client, VALORANT, Vanguard and core Windows processes are never touched.
+//   2. Trims the working set of background processes (pages go to standby, not lost).
 //   3. Flushes the modified page list to disk.
-//   4. Purges the standby list (cached file data) so it shows up as "free".
+//   4. Purges the LOW-PRIORITY standby list only, so useful file cache (e.g. VALORANT's
+//      own game files from the last session) is kept and loading stays fast.
+//   5. Launches VALORANT through the Riot Client.
+// Options: --no-launch  --dry-run (show what would be closed, change nothing)  --no-pause
 // Requires administrator rights (requested via the embedded manifest).
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text.RegularExpressions;
+using System.Threading;
 using Microsoft.Win32;
 
 class CleanMemory
@@ -63,7 +73,54 @@ class CleanMemory
 
     const int SystemMemoryListInformation = 80;
     const int MemoryFlushModifiedList = 3;
-    const int MemoryPurgeStandbyList = 4;
+    const int MemoryPurgeLowPriorityStandbyList = 5;
+
+    // ---- configuration ----
+    const string KillListFile = "kill-list.txt";
+
+    const string DefaultKillList =
+@"# Apps CleanMemory closes before launching VALORANT.
+# One process name per line (the "".exe"" is optional). Lines starting with # are ignored.
+# Riot Client, VALORANT, Vanguard and core Windows processes are always protected.
+
+# Steam
+steam
+steamwebhelper
+steamservice
+steamerrorreporter
+gameoverlayui
+
+# Other launchers
+EpicGamesLauncher
+EpicWebHelper
+Battle.net
+EADesktop
+upc
+
+# Browsers - usually the biggest RAM users. Reopen and use ""restore tabs"" after playing.
+brave
+chrome
+msedge
+firefox
+opera
+
+# Remove the # if you don't need these while playing
+# Discord
+# Spotify
+# GitHubDesktop
+";
+
+    // Never closed and never trimmed: the game, its launcher, its anti-cheat, and Windows itself.
+    static readonly HashSet<string> Protected = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "Riot Client", "RiotClientServices", "RiotClientUx", "RiotClientUxRender", "RiotClientCrashHandler",
+        "VALORANT", "VALORANT-Win64-Shipping", "vgc", "vgtray", "vgk",
+        "System", "Idle", "Registry", "smss", "csrss", "wininit", "winlogon", "services", "lsass",
+        "svchost", "dwm", "explorer", "fontdrvhost", "MsMpEng", "audiodg", "Memory Compression",
+        "CleanMemory"
+    };
+
+    const string ValorantProcess = "VALORANT-Win64-Shipping";
 
     // ---- helpers ----
     static MEMORYSTATUSEX GetMemory()
@@ -75,6 +132,21 @@ class CleanMemory
     }
 
     static string Mb(ulong bytes) { return (bytes / (1024 * 1024)).ToString("N0") + " MB"; }
+
+    // Prints the change in available memory since the last call.
+    static ulong lastAvail;
+    static string Delta()
+    {
+        ulong now = GetMemory().ullAvailPhys;
+        long diff = ((long)now - (long)lastAvail) / (1024 * 1024);
+        lastAvail = now;
+        return string.Format("  [{0}{1:N0} MB]", diff >= 0 ? "+" : "", diff);
+    }
+
+    static bool IsAdmin()
+    {
+        return new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
+    }
 
     static bool EnablePrivilege(string name)
     {
@@ -91,60 +163,109 @@ class CleanMemory
         finally { CloseHandle(token); }
     }
 
-    static bool SystemMemoryCommand(int command)
+    // Returns "OK" or the NTSTATUS code, e.g. 0xC0000061 = privilege not held.
+    static string SystemMemoryCommand(int command)
     {
-        return NtSetSystemInformation(SystemMemoryListInformation, ref command, sizeof(int)) == 0;
+        int status = NtSetSystemInformation(SystemMemoryListInformation, ref command, sizeof(int));
+        return status == 0 ? "OK" : string.Format("failed (NTSTATUS 0x{0:X8})", status);
     }
 
-    // Steam-related processes, matched by name prefix: steam, steamwebhelper, SteamService,
-    // steamerrorreporter, gameoverlayui, ...
-    static readonly string[] SteamPrefixes = { "steam", "gameoverlayui" };
-
-    static Process[] GetSteamProcesses()
+    static bool IsRunning(string name)
     {
-        return Process.GetProcesses().Where(p =>
-            SteamPrefixes.Any(s => p.ProcessName.StartsWith(s, StringComparison.OrdinalIgnoreCase))).ToArray();
+        var procs = Process.GetProcessesByName(name);
+        foreach (var p in procs) p.Dispose();
+        return procs.Length > 0;
     }
 
-    // Returns the number of Steam processes that were running.
-    static int CloseSteam()
+    // Reads kill-list.txt next to the exe, creating it with defaults on first run.
+    static HashSet<string> LoadKillList()
     {
-        var procs = GetSteamProcesses();
+        string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, KillListFile);
+        if (!File.Exists(path))
+        {
+            try { File.WriteAllText(path, DefaultKillList); }
+            catch { }
+        }
+        string[] lines = File.Exists(path) ? File.ReadAllLines(path) : DefaultKillList.Split('\n');
+
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string raw in lines)
+        {
+            string line = raw.Trim();
+            if (line.Length == 0 || line.StartsWith("#")) continue;
+            if (line.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) line = line.Substring(0, line.Length - 4);
+            if (!Protected.Contains(line)) names.Add(line);
+        }
+        return names;
+    }
+
+    static Process[] GetListedProcesses(HashSet<string> names)
+    {
+        return Process.GetProcesses().Where(p => names.Contains(p.ProcessName)).ToArray();
+    }
+
+    // Closes every listed process. Returns how many were running; 'left' is how many survived.
+    static int CloseApps(HashSet<string> names, bool dryRun, out int left)
+    {
+        var procs = GetListedProcesses(names);
+        left = 0;
         if (procs.Length == 0) return 0;
 
-        // Graceful first, so Steam can finish cloud saves and write its config.
-        // Only done if the main client is running, so this never launches Steam.
-        var client = procs.FirstOrDefault(p => p.ProcessName.Equals("steam", StringComparison.OrdinalIgnoreCase));
-        if (client != null)
+        if (dryRun)
+        {
+            Console.WriteLine();
+            foreach (var g in procs.GroupBy(p => p.ProcessName, StringComparer.OrdinalIgnoreCase))
+                Console.WriteLine("        would close {0} ({1} processes)", g.Key, g.Count());
+            foreach (var p in procs) p.Dispose();
+            return procs.Length;
+        }
+
+        // Graceful first: Steam finishes cloud saves via -shutdown (only if the client is
+        // already running, so this never launches Steam); other apps get their windows closed.
+        int waitMs = 5000;
+        var steam = procs.FirstOrDefault(p => p.ProcessName.Equals("steam", StringComparison.OrdinalIgnoreCase));
+        if (steam != null)
         {
             try
             {
                 string exe = Registry.GetValue(@"HKEY_CURRENT_USER\Software\Valve\Steam", "SteamExe", null) as string
-                             ?? client.MainModule.FileName;
-                Process.Start(exe, "-shutdown");
-                client.WaitForExit(15000);
+                             ?? steam.MainModule.FileName;
+                using (Process.Start(exe, "-shutdown")) { }
+                waitMs = 15000;
             }
             catch { }
         }
+        foreach (var p in procs)
+        {
+            try { if (p.MainWindowHandle != IntPtr.Zero) p.CloseMainWindow(); }
+            catch { }
+        }
 
-        // Force-kill whatever is left (helpers, service, or a client that ignored -shutdown).
-        foreach (var p in GetSteamProcesses())
+        var deadline = DateTime.Now.AddMilliseconds(waitMs);
+        while (DateTime.Now < deadline && procs.Any(p => { try { return !p.HasExited; } catch { return false; } }))
+            Thread.Sleep(250);
+
+        // Force-kill whatever is left (helpers, services, or apps that ignored the close request).
+        foreach (var p in GetListedProcesses(names))
         {
             try { p.Kill(); p.WaitForExit(3000); }
             catch { }
             finally { p.Dispose(); }
         }
         foreach (var p in procs) p.Dispose();
+
+        left = GetListedProcesses(names).Length;
         return procs.Length;
     }
 
-    static int TrimAllWorkingSets()
+    static int TrimBackgroundWorkingSets()
     {
         int trimmed = 0;
         foreach (var p in Process.GetProcesses())
         {
             try
             {
+                if (Protected.Contains(p.ProcessName)) continue;
                 IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA, false, p.Id);
                 if (h == IntPtr.Zero) continue; // protected/system process - skip
                 if (EmptyWorkingSet(h)) trimmed++;
@@ -156,46 +277,110 @@ class CleanMemory
         return trimmed;
     }
 
-    static void Main()
+    // Riot records the client location in RiotClientInstalls.json; fall back to the default path.
+    static string FindRiotClient()
     {
+        try
+        {
+            string json = File.ReadAllText(Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                @"Riot Games\RiotClientInstalls.json"));
+            var m = Regex.Match(json, "\"rc_default\"\\s*:\\s*\"([^\"]+)\"");
+            if (m.Success)
+            {
+                string path = m.Groups[1].Value.Replace('/', '\\');
+                if (File.Exists(path)) return path;
+            }
+        }
+        catch { }
+        string fallback = @"C:\Riot Games\Riot Client\RiotClientServices.exe";
+        return File.Exists(fallback) ? fallback : null;
+    }
+
+    static string LaunchValorant()
+    {
+        string rc = FindRiotClient();
+        if (rc == null) return "Riot Client not found - start VALORANT yourself";
+        try
+        {
+            using (Process.Start(rc, "--launch-product=valorant --launch-patchline=live")) { }
+            return "started";
+        }
+        catch (Exception e) { return "failed: " + e.Message; }
+    }
+
+    static void Main(string[] args)
+    {
+        bool noLaunch = args.Contains("--no-launch", StringComparer.OrdinalIgnoreCase);
+        bool dryRun = args.Contains("--dry-run", StringComparer.OrdinalIgnoreCase);
+        bool noPause = args.Contains("--no-pause", StringComparer.OrdinalIgnoreCase);
+
         Console.Title = "Clean Memory";
         var before = GetMemory();
-        Console.WriteLine("Before: {0} free of {1} ({2}% in use)\n",
-            Mb(before.ullAvailPhys), Mb(before.ullTotalPhys), before.dwMemoryLoad);
+        lastAvail = before.ullAvailPhys;
+        Console.WriteLine("Before: {0} available of {1} ({2}% in use){3}\n",
+            Mb(before.ullAvailPhys), Mb(before.ullTotalPhys), before.dwMemoryLoad, dryRun ? "  [DRY RUN]" : "");
 
-        bool admin = EnablePrivilege("SeProfileSingleProcessPrivilege");
+        bool admin = IsAdmin();
+        bool canPurge = admin && EnablePrivilege("SeProfileSingleProcessPrivilege");
         EnablePrivilege("SeIncreaseQuotaPrivilege");
         EnablePrivilege("SeDebugPrivilege");
 
-        Console.Write("[1/4] Closing Steam...                ");
-        int steam = CloseSteam();
-        int left = GetSteamProcesses().Length;
-        Console.WriteLine(steam == 0 ? "not running"
-                        : left == 0 ? steam + " processes closed"
-                        : left + " processes could not be closed");
+        bool inGame = IsRunning(ValorantProcess);
+        if (inGame) Console.WriteLine("VALORANT is already running - it will not be touched or relaunched.\n");
 
-        Console.WriteLine("[2/4] Trimming process working sets... {0} processes trimmed", TrimAllWorkingSets());
+        Console.Write("[1/5] Closing listed apps...           ");
+        int left;
+        int closed = CloseApps(LoadKillList(), dryRun, out left);
+        if (!dryRun)
+            Console.WriteLine((closed == 0 ? "none running"
+                            : left == 0 ? closed + " processes closed"
+                            : left + " of " + closed + " processes could not be closed") + Delta());
 
-        if (admin)
+        if (dryRun)
         {
-            Console.WriteLine("[3/4] Flushing modified page list...  {0}",
-                SystemMemoryCommand(MemoryFlushModifiedList) ? "OK" : "failed");
-            Console.WriteLine("[4/4] Purging standby list...         {0}",
-                SystemMemoryCommand(MemoryPurgeStandbyList) ? "OK" : "failed");
+            if (closed == 0) Console.WriteLine("none running");
+            Console.WriteLine("\nDry run - nothing was changed. Edit {0} to choose what gets closed.", KillListFile);
         }
         else
         {
-            Console.WriteLine("[3/4] Skipped - run as administrator to flush/purge system lists.");
-            Console.WriteLine("[4/4] Skipped.");
+            Console.WriteLine("[2/5] Trimming background processes... {0} trimmed{1}",
+                TrimBackgroundWorkingSets(), Delta());
+
+            if (canPurge)
+            {
+                Console.WriteLine("[3/5] Flushing modified page list...   {0}{1}",
+                    SystemMemoryCommand(MemoryFlushModifiedList), Delta());
+                Console.WriteLine("[4/5] Purging low-priority cache...    {0}{1}",
+                    SystemMemoryCommand(MemoryPurgeLowPriorityStandbyList), Delta());
+            }
+            else
+            {
+                Console.WriteLine("[3/5] Skipped - run as administrator to flush/purge system lists.");
+                Console.WriteLine("[4/5] Skipped.");
+            }
+
+            var after = GetMemory();
+            long freed = (long)after.ullAvailPhys - (long)before.ullAvailPhys;
+            Console.WriteLine("\nAfter:  {0} available of {1} ({2}% in use)",
+                Mb(after.ullAvailPhys), Mb(after.ullTotalPhys), after.dwMemoryLoad);
+            Console.WriteLine("Freed:  {0:N0} MB\n", freed / (1024 * 1024));
+
+            string launch = noLaunch ? "skipped (--no-launch)" : inGame ? "skipped (already running)" : LaunchValorant();
+            Console.WriteLine("[5/5] Launching VALORANT...            {0}", launch);
+
+            if (launch == "started" && !noPause)
+            {
+                Console.WriteLine("\nGood luck! This window closes in 5 seconds.");
+                Thread.Sleep(5000);
+                return;
+            }
         }
 
-        var after = GetMemory();
-        long freed = (long)after.ullAvailPhys - (long)before.ullAvailPhys;
-        Console.WriteLine("\nAfter:  {0} free of {1} ({2}% in use)",
-            Mb(after.ullAvailPhys), Mb(after.ullTotalPhys), after.dwMemoryLoad);
-        Console.WriteLine("Freed:  {0:N0} MB", freed / (1024 * 1024));
-
-        Console.WriteLine("\nPress any key to exit...");
-        Console.ReadKey(true);
+        if (!noPause)
+        {
+            Console.WriteLine("\nPress any key to exit...");
+            Console.ReadKey(true);
+        }
     }
 }
